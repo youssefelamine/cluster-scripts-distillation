@@ -2,6 +2,7 @@ import random
 import numpy as np
 from matplotlib.pyplot import cm
 import csv
+import hashlib
 import json
 import os
 from decimal import Decimal
@@ -10,9 +11,12 @@ from Environment import Environment
 from HttpClient import HttpClient
 from CmdManager import CmdManager
 from DdqnAgent import DoubleDeepQNetwork
+from ExperimentConfig import ExperimentConfig
 import matplotlib.pyplot as plt
 import shutil
 import argparse
+import tensorflow as tf
+from tensorflow import keras
 
 
 # Copies a CICFlowMeter output file to a new location.
@@ -131,6 +135,49 @@ def write_checkpoint_metadata(checkpoint_dir,
         json.dump(metadata, metadata_file, indent=2)
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_model_manifest(config, experiment_config, env, ddqn_agent):
+    teacher_path = experiment_config.teacher_weights
+    teacher_sha256 = None
+    if teacher_path:
+        resolved_path = ddqn_agent._resolve_weights_file(teacher_path)
+        if os.path.isfile(resolved_path):
+            teacher_path = os.path.abspath(resolved_path)
+            teacher_sha256 = sha256_file(resolved_path)
+
+    manifest = {
+        "experiment_name": experiment_config.experiment_name,
+        "model_type": experiment_config.model_type,
+        "distillation_method": experiment_config.distillation_method,
+        "distillation_parameters": experiment_config.distillation,
+        "teacher_checkpoint_path": teacher_path,
+        "teacher_checkpoint_sha256": teacher_sha256,
+        "seed": experiment_config.seed,
+        "state_size": int(env.INPUT_SHAPE),
+        "action_size": int(env.OUTPUT_SHAPE),
+        "trainable_parameter_count": int(
+            sum(np.prod(weight.shape) for weight in ddqn_agent.model.trainable_weights)
+        ),
+        "topology": config.hosts_topo_file_name,
+        "controlled_switch_count": config.nbr_controlled_switches,
+        "episodes": config.episodes,
+        "steps": config.steps,
+        "tensorflow_version": tf.__version__,
+        "keras_version": keras.__version__,
+        "model_path": "rl_model.weights.h5",
+    }
+    manifest_path = f"{config.rl_models_folder}/model_manifest.json"
+    with open(manifest_path, "w") as manifest_file:
+        json.dump(manifest, manifest_file, indent=2)
+
+
 # The main block initializes the reinforcement learning environment and manages the experiment workflow.
 # Key steps include:
 # - Parsing command-line arguments for experiment configurations.
@@ -145,31 +192,75 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Main",
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("-a", "--attackers", help="Attacker hosts names. E.g: [h1]", required=False)
-    parser.add_argument("-e", "--episodes", help="Number of episodes. E.g: 50", required=False)
-    parser.add_argument("-s", "--steps", help="Number of steps. E.g: 100", required=False)
-    parser.add_argument("-ed", "--epsilon-decay", help="Epsilon decay. E.g: 0.999", required=False)
-    parser.add_argument("-ncs", "--nbr-controlled-switches", help="The number of controlled switches in the network", required=False)
+    parser.add_argument("-e", "--episodes", type=int, help="Number of episodes. E.g: 50", required=False)
+    parser.add_argument("-s", "--steps", type=int, help="Number of steps. E.g: 100", required=False)
+    parser.add_argument("-ed", "--epsilon-decay", type=float, help="Epsilon decay. E.g: 0.999", required=False)
+    parser.add_argument("-ncs", "--nbr-controlled-switches", type=int, help="The number of controlled switches in the network", required=False)
     parser.add_argument("-c", "--controlled", action="store_true",
                         help="Whether to control action taking")
     parser.add_argument("-pfa", "--prefilled-actions", action="store_true",
                         help="Whether to use prefilled actions, from file 'prefilled-actions.txt'")
     parser.add_argument("-htf", "--hosts-topo-file",
                         help="When given, the provided JSON file in the 'input-data' folder will be used. E.g: hosts-topology-6hosts",
-                        required=False, default="hosts-toplogy-6hosts")
-    parser.add_argument("--checkpoint-every", type=int, default=5,
+                        required=False)
+    parser.add_argument("--checkpoint-every", type=int,
                         help="Save periodic checkpoints every N episodes")
-    parser.add_argument("--keep-last-checkpoints", type=int, default=10,
+    parser.add_argument("--keep-last-checkpoints", type=int,
                         help="How many periodic checkpoints to keep")
+    parser.add_argument("--experiment-config", help="Path to an experiment JSON file")
+    parser.add_argument("--model-type", choices=["teacher", "student_a", "student_b"])
+    parser.add_argument("--distillation-method", choices=["none", "q_blend"])
+    parser.add_argument("--teacher-weights", help="Path to teacher .weights.h5 checkpoint")
+    parser.add_argument("--distillation-alpha", type=float, help="Q-blend Bellman target weight")
+    parser.add_argument("--seed", type=int, help="Random seed")
     # Initializes the simulation environment and its components.
     # This involves setting up the network topology, controlled switches, and hosts.
-    config = vars(parser.parse_args())
-    is_controlled = config['controlled']
-    is_prefilled_actions = config['prefilled_actions']
+    args = parser.parse_args()
+    is_controlled = args.controlled
+    is_prefilled_actions = args.prefilled_actions
     if is_controlled and is_prefilled_actions:
         raise Exception("Please use either '--controlled' flag or '--prefilled-actions' flag, but not both!")
+
+    experiment_config = (
+        ExperimentConfig.from_file(args.experiment_config, validate=False)
+        if args.experiment_config
+        else ExperimentConfig()
+    )
+    overrides = {
+        "attackers": args.attackers,
+        "episodes": args.episodes,
+        "steps": args.steps,
+        "epsilon_decay": args.epsilon_decay,
+        "nbr_controlled_switches": args.nbr_controlled_switches,
+        "hosts_topo_file": args.hosts_topo_file,
+        "checkpoint_every": args.checkpoint_every,
+        "keep_last_checkpoints": args.keep_last_checkpoints,
+        "model_type": args.model_type,
+        "distillation_method": args.distillation_method,
+        "teacher_weights": args.teacher_weights,
+        "seed": args.seed,
+    }
+    experiment_values = experiment_config.to_dict()
+    for key, value in overrides.items():
+        if value is not None:
+            experiment_values[key] = value
+    if args.distillation_alpha is not None:
+        experiment_values["distillation"] = {
+            **experiment_values.get("distillation", {}),
+            "alpha": args.distillation_alpha,
+        }
+    experiment_config = ExperimentConfig(
+        experiment_values, source_path=experiment_config.source_path
+    )
+
+    if experiment_config.seed is not None:
+        random.seed(experiment_config.seed)
+        np.random.seed(experiment_config.seed)
+        tf.keras.utils.set_random_seed(experiment_config.seed)
+
     pre_set_attackers = []
-    if not (config['attackers'] is None or config['attackers'] == '' or config['attackers'] == '[]'):
-        raw_attackers = config['attackers'].lstrip("[").rstrip("]").split(',')
+    if experiment_config.attackers not in ("", "[]"):
+        raw_attackers = experiment_config.attackers.lstrip("[").rstrip("]").split(',')
         pre_set_attackers = [a.strip().strip("'\"") for a in raw_attackers]
     if is_controlled:
         print('(Reinforcement) ================> Main Started with "controlled actions"')
@@ -177,52 +268,42 @@ if __name__ == '__main__':
         print('(Reinforcement) ================> Main Started with "prefilled actions"')
     else:
         print('(Reinforcement) ================> Main Started')
-    hosts_topo_file_name = 'hosts-toplogy-6hosts.json'
-    if not ('hosts_topo_file' not in config or config['hosts_topo_file'] is None or config[
-        'hosts_topo_file'] == ''):
-        hosts_topo_file_name = config['hosts_topo_file']
-        if not hosts_topo_file_name.lower().endswith(".json"):
-            hosts_topo_file_name += ".json"
-    episodes = 50
-    if not ('episodes' not in config or config['episodes'] is None or config['episodes'] == ''):
-        episodes = int(config['episodes'])
-        print(f'(Reinforcement) ==================> Episodes: {episodes}')
-    steps = 100
-    if not ('steps' not in config or config['steps'] is None or config['steps'] == ''):
-        steps = int(config['steps'])
-        print(f'(Reinforcement) ==================> Steps: {steps}')
-    epsilon_decay = 0.999
-    if not ('epsilon_decay' not in config or config['epsilon_decay'] is None or config[
-        'epsilon_decay'] == ''):
-        epsilon_decay = float(config['epsilon_decay'])
-        if epsilon_decay >= 1 or epsilon_decay <= 0.1:
-            raise Exception("Epsilon decay must be in the range ]0.1, 1[!")
-        print(f'(Reinforcement) ==================> Epsilon decay: {epsilon_decay}')
-    nbr_controlled_switches = 4
-    if not ('nbr_controlled_switches' not in config or config['nbr_controlled_switches'] is None or config['nbr_controlled_switches'] == ''):
-        nbr_controlled_switches = int(config['nbr_controlled_switches'])
-        if nbr_controlled_switches < 4:
-            raise Exception(f"Number of controlled switches set to a ({nbr_controlled_switches}) which is lower than 4. Min value is 4!")
-        if nbr_controlled_switches > 99:
-            raise Exception(f"Number of controlled switches set to a ({nbr_controlled_switches}) which is more than 99. max value is 99!")
-        print(f'(Reinforcement) ==================> Number of controlled switches: {nbr_controlled_switches}')
-    checkpoint_every = int(config['checkpoint_every'])
-    keep_last_checkpoints = int(config['keep_last_checkpoints'])
-    if checkpoint_every <= 0:
-        raise Exception("Checkpoint cadence must be greater than 0")
-    if keep_last_checkpoints <= 0:
-        raise Exception("Number of kept checkpoints must be greater than 0")
+    hosts_topo_file_name = experiment_config.hosts_topo_file
+    if not hosts_topo_file_name.lower().endswith(".json"):
+        hosts_topo_file_name += ".json"
+    episodes = experiment_config.episodes
+    steps = experiment_config.steps
+    epsilon_decay = float(experiment_config.epsilon_decay)
+    nbr_controlled_switches = experiment_config.nbr_controlled_switches
+    checkpoint_every = experiment_config.checkpoint_every
+    keep_last_checkpoints = experiment_config.keep_last_checkpoints
+    print(f'(Reinforcement) ==================> Experiment: {experiment_config.experiment_name}')
+    print(f'(Reinforcement) ==================> Model type: {experiment_config.model_type}')
+    print(f'(Reinforcement) ==================> Distillation: {experiment_config.distillation_method}')
+    print(f'(Reinforcement) ==================> Episodes: {episodes}')
+    print(f'(Reinforcement) ==================> Steps: {steps}')
+    print(f'(Reinforcement) ==================> Epsilon decay: {epsilon_decay}')
+    print(f'(Reinforcement) ==================> Number of controlled switches: {nbr_controlled_switches}')
     print(f'(Reinforcement) ==================> Checkpoint every: {checkpoint_every} episode(s)')
     print(f'(Reinforcement) ==================> Keep periodic checkpoints: {keep_last_checkpoints}')
 
     config = Configuration(hosts_topo_file_name, episodes, steps, epsilon_decay, nbr_controlled_switches)
+    experiment_config.write(f"{config.configs_folder}/experiment.json")
     env = Environment(config)
     cmd = CmdManager(config)
     http_client = HttpClient(config)
     tot_rewards = 0
     total_rewards_per_episode = []
     epsilons = []
-    ddqn_agent = DoubleDeepQNetwork(config, env, http_client, is_controlled, is_prefilled_actions)
+    ddqn_agent = DoubleDeepQNetwork(
+        config,
+        env,
+        http_client,
+        is_controlled,
+        is_prefilled_actions,
+        experiment_config=experiment_config,
+    )
+    write_model_manifest(config, experiment_config, env, ddqn_agent)
     checkpoint_dir = f"{config.rl_models_folder}/checkpoints"
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
@@ -388,7 +469,7 @@ if __name__ == '__main__':
 
             # Experience Replay
             if len(ddqn_agent.memory) > ddqn_agent.batch_size:
-                ddqn_agent.experience_replay(ddqn_agent.batch_size)
+                ddqn_agent.experience_replay(ddqn_agent.batch_size, episode=episode, step=step)
             else:
                 ddqn_agent.episode_loss.append(1)
 

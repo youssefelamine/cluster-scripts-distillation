@@ -12,6 +12,7 @@ from Environment import Environment
 from HttpClient import HttpClient
 from CmdManager import CmdManager
 from DdqnAgent import DoubleDeepQNetwork
+from ExperimentConfig import ExperimentConfig
 
 
 def get_attack_type():
@@ -78,6 +79,24 @@ def load_pretrained_model(ddqn_agent, model_path):
     raise FileNotFoundError(f"Model path not found: {model_path}")
 
 
+def resolve_model_selection(args):
+    model_path = args.model
+    model_type = args.model_type
+    if args.manifest:
+        if not os.path.isfile(args.manifest):
+            raise FileNotFoundError(f"Model manifest not found: {args.manifest}")
+        with open(args.manifest) as manifest_file:
+            manifest = json.load(manifest_file)
+        model_type = model_type or manifest.get("model_type")
+        if model_path is None:
+            model_path = manifest.get("model_path")
+            if model_path and not os.path.isabs(model_path):
+                model_path = os.path.join(os.path.dirname(args.manifest), model_path)
+    if model_path is None:
+        raise ValueError("--model is required unless --manifest provides model_path")
+    return model_type or "teacher", model_path
+
+
 def build_sender_receiver_relation(env):
     relation = {}
     for host in env.normal_hosts:
@@ -135,13 +154,28 @@ def run_evaluation(args):
     epsilon_decay = 0.999
     nbr_controlled_switches = 4
 
+    model_type, model_path = resolve_model_selection(args)
     config = Configuration(hosts_topo_file_name, args.episodes, args.steps, epsilon_decay, nbr_controlled_switches)
     env = Environment(config)
     http_client = HttpClient(config)
     cmd = CmdManager(config)
-    ddqn_agent = DoubleDeepQNetwork(config, env, http_client, is_controlled=False, is_prefilled_actions=False)
+    experiment_config = ExperimentConfig(
+        {
+            "experiment_name": "evaluation",
+            "model_type": model_type,
+            "distillation_method": "none",
+        }
+    )
+    ddqn_agent = DoubleDeepQNetwork(
+        config,
+        env,
+        http_client,
+        is_controlled=False,
+        is_prefilled_actions=False,
+        experiment_config=experiment_config,
+    )
 
-    load_pretrained_model(ddqn_agent, args.model)
+    load_pretrained_model(ddqn_agent, model_path)
 
     pre_set_attackers = parse_hosts_arg(args.attackers)
     env.update_hosts()
@@ -248,7 +282,7 @@ def run_evaluation(args):
     finally:
         cmd.stop_network()
 
-    save_play_results(config, args.model, env.attacker_hosts, episodes_payload, csv_rows)
+    save_play_results(config, model_path, env.attacker_hosts, episodes_payload, csv_rows)
 
 
 if __name__ == '__main__':
@@ -256,7 +290,10 @@ if __name__ == '__main__':
         description="Evaluate pretrained DDQN model",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--model", required=True, help="Path to .weights.h5 file (or base path without extension). Legacy SavedModel directories are also supported")
+    parser.add_argument("--model", help="Path to .weights.h5 file (or base path without extension). Legacy SavedModel directories are also supported")
+    parser.add_argument("--model-type", choices=["teacher", "student_a", "student_b"],
+                        help="Architecture used by the checkpoint")
+    parser.add_argument("--manifest", help="Model manifest providing model type and optionally model path")
     parser.add_argument("--attackers", default="['h1']", help="Attacker hosts list, e.g. ['h1']")
     parser.add_argument("--steps", type=int, default=5, help="Steps per episode")
     parser.add_argument("--episodes", type=int, default=1, help="Number of episodes")

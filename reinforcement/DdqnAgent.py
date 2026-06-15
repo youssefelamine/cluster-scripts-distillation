@@ -1,8 +1,10 @@
-from tensorflow import keras
+import csv
 import numpy as np
 import random
 import os
 from Util import Util
+from ModelFactory import build_model
+from distillation import build_strategy
 
 from collections import deque
 
@@ -13,7 +15,15 @@ class DoubleDeepQNetwork():
     # Sets up hyperparameters like epsilon for exploration, gamma for discounting, and batch size for training.
     # Initializes the neural network models for both the primary and target Q-networks.
     # If prefilled actions are provided, they are loaded for controlled execution.
-    def __init__(self, config, env, http_client, is_controlled, is_prefilled_actions):
+    def __init__(
+        self,
+        config,
+        env,
+        http_client,
+        is_controlled,
+        is_prefilled_actions,
+        experiment_config=None,
+    ):
         self.ACTIONS = None
         self.config = config
         self.env = env
@@ -35,12 +45,30 @@ class DoubleDeepQNetwork():
         self.memory_size = 2500
         self.memory = deque(maxlen=self.memory_size)
         self.update_target_each = 10 # steps
+        self.model_type = (
+            experiment_config.model_type if experiment_config is not None else "teacher"
+        )
+        self.distillation_method = (
+            experiment_config.distillation_method if experiment_config is not None else "none"
+        )
+        distillation_parameters = (
+            experiment_config.distillation if experiment_config is not None else {}
+        )
+        self.distillation_strategy = build_strategy(
+            self.distillation_method, distillation_parameters
+        )
+        self.teacher_weights = (
+            experiment_config.teacher_weights if experiment_config is not None else None
+        )
+        self.replay_updates = 0
+        self.distillation_metrics_file = None
 
         # model is updated instantly
         # target_model updated after each batch
         self.model = self.build_model()
         self.model_target = self.build_model()
         self.update_target_from_model()  # Update weights
+        self.teacher_model = self._build_teacher_model_if_required()
         self.loss = []
         self.episode_loss = []
 
@@ -58,23 +86,42 @@ class DoubleDeepQNetwork():
             lines = [line.strip() for line in file.readlines() if line.strip()]
             return lines
 
-    # Constructs the neural network model for the DDQN agent using Keras.
-    # The model consists of multiple dense layers with ReLU and Sigmoid activations for non-linear transformations.
-    # The final layer uses a linear activation since it represents Q-values for each possible action.
-    # The model is compiled using Mean Squared Error loss and the Adam optimizer for backpropagation.
     def build_model(self):
-        model = keras.Sequential()
-        model.add(keras.layers.Input(shape=(int(self.nS),)))
-        model.add(keras.layers.Dense(int(self.nS), activation='relu'))  # [Input] -> Layer 1
-        model.add(keras.layers.Dense(int(2 * self.nS), activation='relu'))
-        model.add(keras.layers.Dense(int(4*(self.nS + self.nA)+2), activation='relu'))
-        model.add(keras.layers.Dense(int(2*self.nS+2), activation='sigmoid'))
-        model.add(keras.layers.Dense(int(self.nA), activation='linear'))  # Layer 5 -> [output]
-        #   Size has to match the output (different actions)
-        #   Linear activation on the last layer
-        model.compile(loss='mean_squared_error',  # Loss function: Mean Squared Error
-                      optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate))  # Optimizer: Adam (Feel free to check other options)
-        return model
+        return build_model(self.model_type, self.nS, self.nA, self.learning_rate)
+
+    def _build_teacher_model_if_required(self):
+        if not self.distillation_strategy.requires_teacher:
+            return None
+        if not self.teacher_weights:
+            raise ValueError(
+                f"Distillation method '{self.distillation_method}' requires teacher weights"
+            )
+        teacher_model = build_model("teacher", self.nS, self.nA, self.learning_rate)
+        self._load_weights_checked(teacher_model, self.teacher_weights, "teacher")
+        teacher_model.trainable = False
+        for layer in teacher_model.layers:
+            layer.trainable = False
+        return teacher_model
+
+    def _load_weights_checked(self, model, filename, label):
+        weights_file = self._resolve_weights_file(filename)
+        if not os.path.isfile(weights_file):
+            raise FileNotFoundError(f"{label.capitalize()} weights file not found: {weights_file}")
+        try:
+            model.load_weights(weights_file)
+        except Exception as exc:
+            raise ValueError(
+                f"Incompatible {label} checkpoint '{weights_file}' for "
+                f"model_type='{model.name}', state_size={self.nS}, action_size={self.nA}: {exc}"
+            ) from exc
+        return weights_file
+
+    @staticmethod
+    def _resolve_weights_file(filename):
+        if filename.endswith(".weights.h5") or os.path.isfile(filename):
+            return filename
+        extensionless_weights = f"{filename}.weights.h5"
+        return extensionless_weights if os.path.exists(extensionless_weights) else filename
 
     # Copies the weights from the primary model to the target model.
     # The target model is used for more stable training updates.
@@ -98,7 +145,7 @@ class DoubleDeepQNetwork():
             action = random.randrange(self.nA)  # Explore
             print(f'<------> Taking action randomly: {action}')
             return action, False
-        action_vals = self.model.predict(np.reshape(state, [1, self.nS]))
+        action_vals = self.model.predict(np.reshape(state, [1, self.nS]), verbose=0)
         # Exploit: Use the NN to predict the correct action from this state
         #   action_vals [0] ==> because the output shape is (1, 9) meaning one line and 12 column
         #   so to get the probabilities of taking each of the 9 actions we use the first line (index 0)
@@ -166,7 +213,7 @@ class DoubleDeepQNetwork():
     # Selects the best action from the model predictions without exploration.
     # Used during testing or evaluation to purely exploit the learned policy.
     def test_action(self, state):  # Exploit
-        action_vals = self.model.predict(np.reshape(state, [1, self.nS]))
+        action_vals = self.model.predict(np.reshape(state, [1, self.nS]), verbose=0)
         return np.argmax(action_vals[0])
 
     # Stores an experience tuple (state, action, reward, next state, done) into the replay memory.
@@ -179,44 +226,41 @@ class DoubleDeepQNetwork():
     # Each experience is processed to compute the target Q-value using the Bellman equation.
     # The model is trained using the generated batch, and epsilon is decayed after each iteration.
     # Double DQN is implemented here by using the target model for stable Q-value estimation.
-    def experience_replay(self, batch_size):
+    def experience_replay(self, batch_size, episode=None, step=None):
         # Execute the experience replay
         # each element of memory is cur_state, action, reward, new_state, done(after each step)
         minibatch = random.sample(self.memory, batch_size)  # Randomly sample from memory
 
         # Convert to numpy for speed by vectorization
         x = []
-        y = []
         minibatch_array = np.array(minibatch, dtype=object)
         st = np.zeros((0, self.nS))  # States
         nst = np.zeros((0, self.nS))  # Next States
         for i in range(len(minibatch_array)):  # Creating the state and next state np arrays
             st = np.append(st, minibatch_array[i, 0].reshape(1, self.nS), axis=0)
             nst = np.append(nst, minibatch_array[i, 3].reshape(1, self.nS), axis=0)
-        st_predict = self.model.predict(st)  # Here is the speedup! I can predict on the ENTIRE batch
-        nst_predict = self.model.predict(nst)
-        nst_predict_target = self.model_target.predict(nst)  # Predict from the TARGET
-        index = 0
-        for state, action, reward, nstate, done in minibatch:
+        st_predict = self.model.predict(st, verbose=0)
+        nst_predict = self.model.predict(nst, verbose=0)
+        nst_predict_target = self.model_target.predict(nst, verbose=0)
+        for state, _, _, _, _ in minibatch:
             x.append(state)
-            # Predict from state
-            nst_action_predict_target = nst_predict_target[index]
-            nst_action_predict_model = nst_predict[index]
-            if done == True:  # Terminal: Just assign reward much like {* (not done) - QB[state][action]}
-                target = reward
-            else:  # Non terminal
-                print(f"<------> reward: {reward} and future reward: {nst_action_predict_target[np.argmax(nst_action_predict_model)]}")
-                target = reward + self.gamma * nst_action_predict_target[
-                    np.argmax(nst_action_predict_model)]  # Using Q to get T is Double DQN
-            target_f = st_predict[index]
-            target_f[action] = target
-            y.append(target_f)
-            index += 1
+        targets, metrics = self.distillation_strategy.construct_targets(
+            minibatch=minibatch,
+            student_q_values=st_predict,
+            next_student_q_values=nst_predict,
+            next_target_q_values=nst_predict_target,
+            gamma=self.gamma,
+            teacher_model=self.teacher_model,
+            states=st,
+        )
         # Reshape for Keras Fit
         x_reshape = np.array(x).reshape(batch_size, self.nS)
-        y_reshape = np.array(y)
+        y_reshape = np.asarray(targets)
         epoch_count = 1
         hist = self.model.fit(x_reshape, y_reshape, epochs=epoch_count, verbose=0)
+        self.replay_updates += 1
+        if metrics is not None:
+            self._record_distillation_metrics(metrics, episode, step)
         # Graph Losses
         for i in range(epoch_count):
             self.loss.append(hist.history['loss'][i])
@@ -226,19 +270,41 @@ class DoubleDeepQNetwork():
             self.epsilon *= self.epsilon_decay
             print("<------> New Epsilon value: " + str(self.epsilon))
 
+        return metrics
+
+    def _record_distillation_metrics(self, metrics, episode, step):
+        if self.distillation_metrics_file is None:
+            self.distillation_metrics_file = os.path.join(
+                self.config.rl_stats_folder, "distillation_metrics.csv"
+            )
+        file_exists = os.path.exists(self.distillation_metrics_file)
+        fieldnames = [
+            "episode",
+            "step",
+            "replay_update_number",
+            "student_teacher_q_mse",
+            "mean_abs_student_q",
+            "max_abs_student_q",
+        ]
+        row = {
+            "episode": "" if episode is None else episode,
+            "step": "" if step is None else step,
+            "replay_update_number": self.replay_updates,
+            **metrics,
+        }
+        with open(self.distillation_metrics_file, "a", newline="") as metrics_file:
+            writer = csv.DictWriter(metrics_file, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
     def save_model(self, filename):
         weights_file = filename if filename.endswith('.weights.h5') else f'{filename}.weights.h5'
         self.model.save_weights(weights_file)
 
     def load_model(self, filename):
-        # Weights-only loading: version-agnostic across Keras 2 and 3
-        weights_file = filename
-        if not weights_file.endswith('.weights.h5'):
-            extensionless_weights = f'{filename}.weights.h5'
-            if os.path.exists(extensionless_weights):
-                weights_file = extensionless_weights
         self.model = self.build_model()
-        self.model.load_weights(weights_file)
+        self._load_weights_checked(self.model, filename, self.model_type)
         self.model_target = self.build_model()
         self.model_target.set_weights(self.model.get_weights())
 

@@ -1,0 +1,16 @@
+{
+  "experiment_name": "teacher_baseline_seed42",
+  "model_type": "teacher",
+  "distillation_method": "none",
+  "teacher_weights": null,
+  "distillation": {},
+  "seed": 42,
+  "attackers": "[h1]",
+  "episodes": 50,
+  "steps": 100,
+  "hosts_topo_file": "hosts-toplogy-6hosts",
+  "nbr_controlled_switches": 4,
+  "epsilon_decay": 0.999,
+  "checkpoint_every": 5,
+  "keep_last_checkpoints": 10
+}

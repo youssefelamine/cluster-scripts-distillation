@@ -1,0 +1,18 @@
+{
+  "experiment_name": "smoke_student_b_q_blend_seed42",
+  "model_type": "student_b",
+  "distillation_method": "q_blend",
+  "teacher_weights": "${TEACHER_WEIGHTS}",
+  "distillation": {
+    "alpha": 0.5
+  },
+  "seed": 42,
+  "attackers": "[h1]",
+  "episodes": 1,
+  "steps": 9,
+  "hosts_topo_file": "hosts-toplogy-6hosts",
+  "nbr_controlled_switches": 4,
+  "epsilon_decay": 0.999,
+  "checkpoint_every": 1,
+  "keep_last_checkpoints": 1
+}

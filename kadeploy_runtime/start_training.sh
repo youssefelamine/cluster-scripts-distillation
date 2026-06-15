@@ -47,9 +47,11 @@ train_args=()
 if [[ -n "${TRAIN_ARGS:-}" ]]; then
   read -r -a train_args <<< "$TRAIN_ARGS"
 fi
+train_args+=("$@")
 
 info "Starting training"
 info "TRAIN_ARGS: ${TRAIN_ARGS:-<project defaults>}"
+info "Positional args: ${*:-<none>}"
 info "Live log: $LOG"
 cd "$PROJECT"
 
